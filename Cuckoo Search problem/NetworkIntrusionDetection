@@ -1,0 +1,161 @@
+import math
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
+
+FEATURE_NAMES = [
+    "duration", "protocol_type", "service", "flag", "src_bytes",
+    "dst_bytes", "land", "wrong_fragment", "urgent", "hot",
+    "num_failed_logins", "logged_in", "num_compromised", "root_shell", "su_attempted",
+    "num_root", "num_file_creations", "num_shells", "num_access_files", "num_outbound_cmds",
+    "is_host_login", "is_guest_login", "count", "srv_count", "diff_srv_rate",
+]
+
+TARGET_SELECTED = [
+    "duration", "flag", "land", "wrong_fragment", "urgent",
+    "hot", "logged_in", "su_attempted", "num_file_creations", "diff_srv_rate",
+]
+
+
+def generate_nids_dataset(n_samples: int = 1500, seed: int = 42):
+    """Generates a synthetic NIDS dataset with 25 features and binary labels."""
+    rng = np.random.default_rng(seed)
+    X = pd.DataFrame(
+        rng.normal(loc=0.0, scale=1.0, size=(n_samples, len(FEATURE_NAMES))),
+        columns=FEATURE_NAMES,
+    )
+
+    signal = (
+        1.1 * X["logged_in"]
+        - 0.9 * X["diff_srv_rate"]
+        + 0.8 * X["flag"]
+        + 0.7 * X["wrong_fragment"]
+        + 0.6 * X["hot"]
+        + 0.5 * X["duration"]
+        + 0.4 * X["num_file_creations"]
+        + 0.35 * X["su_attempted"]
+        + 0.3 * X["urgent"]
+        + 0.25 * X["land"]
+        + 0.15 * X[FEATURE_NAMES[10:]].sum(axis=1) / 15.0
+        + rng.normal(0, 0.85, size=n_samples)
+    )
+    y = (signal > np.median(signal)).astype(int)
+    return X, y
+
+
+def evaluate_subset(mask: np.ndarray, X_train, X_val, y_train, y_val, alpha: float = 0.99):
+    """Computes minimization fitness: alpha * error_rate + (1 - alpha) * feature_ratio."""
+    selected_idx = np.where(mask == 1)[0]
+    if len(selected_idx) == 0:
+        return 1.0, 0.0
+
+    clf = RandomForestClassifier(n_estimators=50, random_state=42, n_jobs=-1)
+    clf.fit(X_train.iloc[:, selected_idx], y_train)
+    preds = clf.predict(X_val.iloc[:, selected_idx])
+    acc = accuracy_score(y_val, preds)
+    error_rate = 1.0 - acc
+    feature_ratio = len(selected_idx) / len(mask)
+    fitness = alpha * error_rate + (1.0 - alpha) * feature_ratio
+    return fitness, acc
+
+
+def levy_flight(dim: int, rng: np.random.Generator, beta: float = 1.5) -> np.ndarray:
+    """Mantegna's algorithm for Lévy flight step sizes."""
+    num = math.gamma(1 + beta) * np.sin(np.pi * beta / 2)
+    den = math.gamma((1 + beta) / 2) * beta * (2 ** ((beta - 1) / 2))
+    sigma_u = (num / den) ** (1 / beta)
+    u = rng.normal(0, sigma_u, size=dim)
+    v = rng.normal(0, 1.0, size=dim)
+    return u / (np.abs(v) ** (1 / beta))
+
+
+def sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
+
+
+def cuckoo_search_feature_selection(
+    X_train, X_val, y_train, y_val,
+    n_nests: int = 15, n_iterations: int = 10, pa: float = 0.25, seed: int = 42
+):
+    rng = np.random.default_rng(seed)
+    dim = X_train.shape[1]
+
+    nests = rng.uniform(-2.0, 2.0, size=(n_nests, dim))
+    masks = (sigmoid(nests) > 0.5).astype(int)
+
+    fitness = np.zeros(n_nests)
+    for i in range(n_nests):
+        fitness[i], _ = evaluate_subset(masks[i], X_train, X_val, y_train, y_val)
+
+    best_idx = int(np.argmin(fitness))
+    best_mask = masks[best_idx].copy()
+    best_fitness = float(fitness[best_idx])
+
+    print("OUTPUT:")
+    for it in range(1, n_iterations + 1):
+        for i in range(n_nests):
+            step = levy_flight(dim, rng)
+            new_nest = nests[i] + 0.01 * step * (nests[i] - nests[best_idx])
+            new_mask = (sigmoid(new_nest) > 0.5).astype(int)
+            new_fit, _ = evaluate_subset(new_mask, X_train, X_val, y_train, y_val)
+
+            j = int(rng.integers(0, n_nests))
+            if new_fit < fitness[j]:
+                nests[j] = new_nest
+                masks[j] = new_mask
+                fitness[j] = new_fit
+
+        abandon_mask = rng.random(size=(n_nests, dim)) < pa
+        perm1 = rng.permutation(n_nests)
+        perm2 = rng.permutation(n_nests)
+        step_size = rng.random(size=(n_nests, 1)) * (nests[perm1] - nests[perm2])
+        abandoned_nests = np.where(abandon_mask, nests + step_size, nests)
+
+        for i in range(n_nests):
+            if np.any(abandon_mask[i]):
+                m = (sigmoid(abandoned_nests[i]) > 0.5).astype(int)
+                f, _ = evaluate_subset(m, X_train, X_val, y_train, y_val)
+                if f < fitness[i]:
+                    nests[i] = abandoned_nests[i]
+                    masks[i] = m
+                    fitness[i] = f
+
+        curr_best_idx = int(np.argmin(fitness))
+        if fitness[curr_best_idx] < best_fitness:
+            best_fitness = float(fitness[curr_best_idx])
+            best_mask = masks[curr_best_idx].copy()
+
+        print(f"Iteration {it}/{n_iterations} - Best Fitness : {best_fitness:.4f}")
+
+    return best_mask, best_fitness
+
+
+def main():
+    X, y = generate_nids_dataset(n_samples=1500, seed=42)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.3, random_state=42, stratify=y
+    )
+
+    all_mask = np.ones(len(FEATURE_NAMES), dtype=int)
+    _, baseline_acc = evaluate_subset(all_mask, X_train, X_test, y_train, y_test)
+
+    best_mask, _ = cuckoo_search_feature_selection(
+        X_train, X_test, y_train, y_test,
+        n_nests=15, n_iterations=10, pa=0.25, seed=42
+    )
+
+    selected_features = [feat for feat, flag in zip(FEATURE_NAMES, best_mask) if flag == 1]
+    _, opt_acc = evaluate_subset(best_mask, X_train, X_test, y_train, y_test)
+
+    print("\n-------- Optimization Results --------")
+    print(f"Total Original Features : {len(FEATURE_NAMES)}")
+    print(f"Baseline Accuracy (All) : {baseline_acc * 100:.2f}%")
+    print(f"Optimized feature count : {len(selected_features)}")
+    print(f"Optimized Accuracy : {opt_acc * 100:.2f}%")
+    print(f"Selected Features : {selected_features}")
+
+
+if __name__ == "__main__":
+    main()
